@@ -271,30 +271,29 @@ class MergeDexTask(Task):
         Task.__init__(self, 'merge_dex_task')
         self._cache_dir = cache_dir
         self._all_modules = all_modules
+        self._pending_merge_dexes = []
 
     def execute(self):
         if is_src_changed(self._cache_dir):
-            pending_merge_dexes = self._get_dexes()
+            self._fill_dexes()
             dex_path = get_incremental_dex_path(self._cache_dir)
-            if len(pending_merge_dexes) == 1:
-                self.debug('just 1 dex need to sync, copy {} to {}'.format(pending_merge_dexes[0], dex_path))
-                shutil.copy(pending_merge_dexes[0], dex_path)
-            elif len(pending_merge_dexes) > 1:
-                dex_path = get_incremental_dex_path(self._cache_dir)
+            if len(self._pending_merge_dexes) == 1:
+                self.debug('just 1 dex need to sync, copy {} to {}'.format(self._pending_merge_dexes[0], dex_path))
+                shutil.copy(self._pending_merge_dexes[0], dex_path)
+            elif len(self._pending_merge_dexes) > 1:
                 dex_merge_args = ['java', '-jar', os.path.join('freeline', 'release-tools', 'DexMerge.jar'), dex_path]
-                dex_merge_args.extend(pending_merge_dexes)
+                dex_merge_args.extend(self._pending_merge_dexes)
                 self.debug('merge dex exec: ' + ' '.join(dex_merge_args))
                 output, err, code = cexec(dex_merge_args, callback=None)
                 if code != 0:
-                    raise FreelineException('merge dex failed: {}'.format(dex_merge_args), output + '\n' + err)
+                    raise FreelineException('merge dex failed: {}'.format(' '.join(dex_merge_args)),
+                                            output + '\n' + err)
 
-    def _get_dexes(self):
-        pending_merge_dexes = []
+    def _fill_dexes(self):
         for bundle in self._all_modules:
             path = os.path.join(self._cache_dir, bundle, 'dex', bundle + '.dex')
             if os.path.exists(path):
-                pending_merge_dexes.append(path)
-        return pending_merge_dexes
+                self._pending_merge_dexes.append(path)
 
 
 class AndroidIncrementalBuildTask(IncrementalBuildTask):
@@ -537,8 +536,7 @@ class AndroidIncBuildInvoker(object):
         javacargs.append('-d')
         javacargs.append(self._finder.get_patch_classes_cache_dir())
 
-        self.debug('javac exec: ' + ' '.join(javacargs))
-        output, err, code = cexec(javacargs, callback=None)
+        output, err, code = self._execute_javac(javacargs)
 
         if code != 0:
             raise FreelineException('incremental javac compile failed.', '{}\n{}'.format(output, err))
@@ -549,6 +547,10 @@ class AndroidIncBuildInvoker(object):
                 shutil.copyfile(new_r_file, old_r_file)
                 self.debug('copy {} to {}'.format(new_r_file, old_r_file))
 
+    def _execute_javac(self, javacargs, callback=None):
+        self.debug('javac exec: ' + ' '.join(javacargs))
+        return cexec(javacargs, callback=callback)
+
     def check_dex_task(self):
         patch_classes_count = calculate_typed_file_count(self._finder.get_patch_classes_cache_dir(), '.class')
         if self._is_need_javac:
@@ -558,6 +560,14 @@ class AndroidIncBuildInvoker(object):
     def run_dex_task(self):
         patch_classes_cache_dir = self._finder.get_patch_classes_cache_dir()
         dex_path = self._finder.get_dst_dex_path()
+        output, err, code = self._execute_dex(patch_classes_cache_dir, dex_path)
+
+        if code != 0:
+            raise FreelineException('incremental dex compile failed.', '{}\n{}'.format(output, err))
+        else:
+            mark_restart_flag(self._cache_dir)
+
+    def _execute_dex(self, patch_classes_cache_dir, dex_path):
         add_path = None
         if is_windows_system():
             add_path = str(os.path.abspath(os.path.join(self._javac, os.pardir)))
@@ -567,12 +577,7 @@ class AndroidIncBuildInvoker(object):
                         patch_classes_cache_dir]
 
         self.debug('dex exec: ' + ' '.join(dex_args))
-        output, err, code = cexec(dex_args, add_path=add_path)
-
-        if code != 0:
-            raise FreelineException('incremental dex compile failed.', '{}\n{}'.format(output, err))
-        else:
-            mark_restart_flag(self._cache_dir)
+        return cexec(dex_args, add_path=add_path)
 
     def _handle_with_backup_files(self, is_success):
         res_dir = self._finder.get_dst_res_dir()
@@ -815,6 +820,26 @@ def clean_res_changed_flag(cache_dir):
 
 def get_res_changed_flag_path(cache_dir):
     return os.path.join(cache_dir, 'increment.resflag')
+
+
+def mark_r_sync_flag(cache_dir):
+    path = get_r_sync_flag_path(cache_dir)
+    if not os.path.exists(path):
+        write_file_content(path, '')
+
+
+def clean_r_sync_flag(cache_dir):
+    path = get_r_sync_flag_path(cache_dir)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def is_r_sync_flag_exists(cache_dir):
+    return os.path.exists(get_r_sync_flag_path(cache_dir))
+
+
+def get_r_sync_flag_path(cache_dir):
+    return os.path.join(cache_dir, 'increment.rsync')
 
 
 def backup_res_file(fpath):

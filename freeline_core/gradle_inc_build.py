@@ -12,6 +12,7 @@ from gradle_tools import get_project_info, GradleDirectoryFinder, GradleSyncClie
 from task import find_root_tasks, find_last_tasks, Task
 from utils import get_file_content, write_file_content, is_windows_system
 from tracing import Tracing
+from exceptions import FreelineException
 
 
 class GradleIncBuilder(IncrementalBuilder):
@@ -24,6 +25,7 @@ class GradleIncBuilder(IncrementalBuilder):
         self._is_art = False
         self._module_dir_map = {}
         self._has_res_changed = self.__is_any_modules_have_res_changed()
+        self._has_java_changed = self.__is_any_modules_have_java_changed()
         self._changed_modules = self.__changed_modules()
 
     def check_build_environment(self):
@@ -64,7 +66,7 @@ class GradleIncBuilder(IncrementalBuilder):
         return GradleIncBuildInvoker(module, self._project_info[module]['path'], self._config,
                                      self._changed_files['projects'][module], self._project_info[module], self._is_art,
                                      all_module_info=self._project_info, module_dir_map=self._module_dir_map,
-                                     is_any_modules_have_res_changed=self._has_res_changed,
+                                     is_any_modules_have_java_changed=self._has_java_changed,
                                      changed_modules=self._changed_modules)
 
     def __merge_res_files(self):
@@ -96,6 +98,13 @@ class GradleIncBuilder(IncrementalBuilder):
         for key, value in self._changed_files['projects'].iteritems():
             if len(value['res']) > 0:
                 self.debug('find {} modules have res changed'.format(key))
+                return True
+        return False
+
+    def __is_any_modules_have_java_changed(self):
+        for key, value in self._changed_files['projects'].iteritems():
+            if len(value['src']) > 0:
+                self.debug('find {} modules have java changed'.format(key))
                 return True
         return False
 
@@ -142,23 +151,25 @@ class GradleAaptTask(Task):
     def execute(self):
         should_run_res_task = self._invoker.check_res_task()
         if not should_run_res_task:
-            self.debug('no need to execute')
-            return
+            self.debug("aapt task doesn't need to be executed")
+        else:
+            self.debug('start to execute aapt command...')
+            self._invoker.fill_dependant_jars()
+            self._invoker.check_ids_change()
 
-        self.debug('start to execute aapt command...')
-        self._invoker.fill_dependant_jars()
-        self._invoker.check_ids_change()
+            with Tracing("generate_id_keeper_files"):
+                self._invoker.generate_r_file()
 
-        with Tracing("generate_id_keeper_files"):
-            self._invoker.generate_r_file()
+            # self._invoker.backup_res_files()
 
-        # self._invoker.backup_res_files()
+            with Tracing("run_incremental_aapt_task"):
+                self._invoker.run_aapt_task()
 
-        with Tracing("run_incremental_aapt_task"):
-            self._invoker.run_aapt_task()
+            with Tracing("check_other_modules_resources"):
+                self._invoker.check_other_modules_resources()
 
-        with Tracing("check_other_modules_resources"):
-            self._invoker.check_other_modules_resources()
+        with Tracing("generate_r_dex"):
+            self._invoker.generate_r_dex()
 
 
 class GradleCompileCommand(CompileCommand):
@@ -198,7 +209,7 @@ class GradleIncJavacCommand(IncJavacCommand):
         IncJavacCommand.__init__(self, module_name, invoker)
 
     def execute(self):
-        self._invoker.check_r_md5()  # check if R.java has changed
+        # self._invoker.check_r_md5()  # check if R.java has changed
         # self._invoker.check_other_modules_resources()
         should_run_javac_task = self._invoker.check_javac_task()
         if not should_run_javac_task:
@@ -206,7 +217,7 @@ class GradleIncJavacCommand(IncJavacCommand):
             return
 
         self.debug('start to execute javac command...')
-        self._invoker.append_r_file()
+        # self._invoker.append_r_file()
         self._invoker.fill_classpaths()
         self._invoker.clean_dex_cache()
         self._invoker.run_javac_task()
@@ -228,13 +239,14 @@ class GradleIncDexCommand(IncDexCommand):
 
 class GradleIncBuildInvoker(android_tools.AndroidIncBuildInvoker):
     def __init__(self, module_name, path, config, changed_files, module_info, is_art, all_module_info=None,
-                 module_dir_map=None, is_any_modules_have_res_changed=False, changed_modules=None):
+                 module_dir_map=None, is_any_modules_have_java_changed=False, changed_modules=None):
         android_tools.AndroidIncBuildInvoker.__init__(self, module_name, path, config, changed_files, module_info,
                                                       is_art=is_art)
         self._all_module_info = all_module_info
         self._module_dir_map = module_dir_map
-        self._is_any_modules_have_res_changed = is_any_modules_have_res_changed
+        self._is_any_modules_have_java_changed = is_any_modules_have_java_changed
         self._changed_modules = changed_modules
+        self._r_files = []
         self._merged_res_paths = []
         self._merged_res_paths.append(self._finder.get_backup_res_dir())
         for mname in self._all_module_info.keys():
@@ -339,11 +351,46 @@ class GradleIncBuildInvoker(android_tools.AndroidIncBuildInvoker):
             changed_modules = self._changed_modules
 
             if len(changed_modules) > 0:
-                self.__modify_main_r()
+                target_main_r = self.__modify_main_r()
+                if target_main_r and os.path.isfile(target_main_r):
+                    self._r_files.append(target_main_r)
+                for module in self._all_module_info.keys():
+                    pn = self._all_module_info[module]['packagename']
+                    if pn and pn != '':
+                        fpath = self.__get_freeline_backup_r_path(pn)
+                        if not os.path.exists(fpath):
+                            fpath = self.__modify_other_modules_r(pn)
+                            if fpath and os.path.isfile(fpath):
+                                self._r_files.append(fpath)
+                                self.debug('modify {}'.format(fpath))
 
-                for module in changed_modules:
-                    fpath = self.__modify_other_modules_r(self._all_module_info[module]['packagename'])
-                    self.debug('modify {}'.format(fpath))
+                android_tools.mark_r_sync_flag(self._config['build_cache_dir'])
+
+    def generate_r_dex(self):
+        if android_tools.is_r_sync_flag_exists(
+                self._config['build_cache_dir']) and self._is_any_modules_have_java_changed:
+            self.debug("start to generate r.dex...")
+            patch_classes_dir = self.__get_freeline_backup_r_classes_dir()
+            javacargs = [self._javac, '-target', '1.7', '-source', '1.7', '-encoding', 'UTF-8', '-g']
+            if len(self._r_files) == 0:
+                for dirpath, dirnames, files in os.walk(self.__get_freeline_backup_r_dir()):
+                    for fn in files:
+                        if fn == 'R.java':
+                            javacargs.append(os.path.join(dirpath, fn))
+            else:
+                for rfile in self._r_files:
+                    javacargs.append(rfile)
+
+            javacargs.append('-d')
+            javacargs.append(patch_classes_dir)
+
+            output, err, code = self._execute_javac(javacargs)
+            if code != 0:
+                raise FreelineException('r.dex javac compile failed.', '{}\n{}'.format(output, err))
+
+            output, err, code = self._execute_dex(patch_classes_dir, self.__get_freeline_r_dex_path())
+            if code != 0:
+                raise FreelineException('r.dex compile failed.', '{}\n{}'.format(output, err))
 
     def __modify_main_r(self):
         main_r_fpath = os.path.join(self._finder.get_backup_dir(),
@@ -362,6 +409,7 @@ class GradleIncBuildInvoker(android_tools.AndroidIncBuildInvoker):
         target_main_r_path = os.path.join(target_main_r_dir, 'R.java')
         self.debug('copy {} to {}'.format(main_r_fpath, target_main_r_path))
         shutil.copy(main_r_fpath, target_main_r_path)
+        return target_main_r_path
 
     def append_r_file(self):
         if self._name != self._config['main_project_name']:
@@ -403,6 +451,7 @@ class GradleIncBuildInvoker(android_tools.AndroidIncBuildInvoker):
         # 5. generated classes in build directory
         patch_classes_cache_dir = self._finder.get_patch_classes_cache_dir()
         self._classpaths.append(patch_classes_cache_dir)
+        self._classpaths.append(self.__get_freeline_backup_r_classes_dir())
         self._classpaths.append(self._finder.get_dst_classes_dir())
         for module in self._module_info['local_module_dep']:
             finder = GradleDirectoryFinder(module, self._module_dir_map[module], self._cache_dir)
@@ -470,6 +519,22 @@ class GradleIncBuildInvoker(android_tools.AndroidIncBuildInvoker):
         if not os.path.exists(dirpath):
             os.makedirs(dirpath)
         return dirpath
+
+    def __get_freeline_backup_r_path(self, package):
+        target_dir = os.path.join(self.__get_freeline_backup_r_dir(), package.replace('.', os.sep))
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+        return os.path.join(target_dir, 'R.java')
+
+    def __get_freeline_backup_r_classes_dir(self):
+        dirpath = os.path.join(self.__get_freeline_backup_r_dir(), 'classes')
+        if not os.path.exists(dirpath):
+            os.makedirs(dirpath)
+        return dirpath
+
+    def __get_freeline_r_dex_path(self):
+        dex_dir = self.__get_freeline_backup_r_dir()
+        return os.path.join(dex_dir, 'r.dex')
 
     def __modify_other_modules_r(self, package_name, finder=None):
         if not finder:

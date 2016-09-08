@@ -387,6 +387,20 @@ class GradleMergeDexTask(android_tools.MergeDexTask):
     def __init__(self, cache_dir, all_modules, project_info):
         android_tools.MergeDexTask.__init__(self, cache_dir, all_modules)
         self._all_modules = [project_info[module]['name'] for module in self._all_modules]
+        self._r_dex_path = os.path.join(self._cache_dir, 'freeline-backup-r', 'r.dex')
+
+    def execute(self):
+        android_tools.MergeDexTask.execute(self)
+        if android_tools.is_r_sync_flag_exists(self._cache_dir) and self._r_dex_path in self._pending_merge_dexes:
+            self.debug('remove r sync flag')
+            android_tools.clean_r_sync_flag(self._cache_dir)
+
+    def _fill_dexes(self):
+        android_tools.MergeDexTask._fill_dexes(self)
+        if len(self._pending_merge_dexes) > 0:
+            if android_tools.is_r_sync_flag_exists(self._cache_dir) and os.path.exists(self._r_dex_path):
+                self.debug('add r.dex to dex merge list')
+                self._pending_merge_dexes.append(self._r_dex_path)
 
 
 class GradleSyncTask(android_tools.SyncTask):
@@ -679,6 +693,19 @@ def fix_package_name(config, manifest):
             Logger.debug('save new manifest to {}'.format(target_manifest_path))
             return target_manifest_path
     return manifest
+
+
+def fix_package_name_in_r(config, origin_r_path, target_r_path):
+    if 'debug_package' in config and config['package'] != config['debug_package']:
+        if origin_r_path and target_r_path and os.path.isfile(origin_r_path) and os.path.isfile(target_r_path):
+            Logger.debug('find app has debug package name, freeline will fix the package name in generated R.java')
+            content = get_file_content(origin_r_path)
+            result = re.sub('package {}'.format(config['debug_package']), 'package {}'.format(config['package']),
+                            content)
+            Logger.debug('change package name from {} to {}'.format(config['debug_package'], config['package']))
+            from utils import write_file_content
+            write_file_content(target_r_path, result)
+            Logger.debug('save new R.java to {}'.format(target_r_path))
 
 
 def get_all_modules(dir_path):
